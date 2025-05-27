@@ -1,0 +1,227 @@
+# Hocho.FCMacro
+# Version: 1.0.0
+# Last updated: 2025-05-27
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+import math
+
+doc = App.newDocument("Hocho")
+
+###計測値入力部分#########################################
+#刃元での計測値<固定値：(BX0,BYb0)=(0,0)>
+BYa0 = 45
+BT = 3
+#峰側の計測値
+(BXa1,BYa1) = (65,45)
+(BXa2,BYa2) = (130,43)
+(BXa3,BYa3) = (155,33)
+#刃側の計測値
+(BXb1,BYb1) = (50,1)
+(BXb2,BYb2) = (115,8)
+(BXb3,BYb3) = (138,12)
+#刃の先端での計測値
+(BX4,BY4) = (166,22)
+#マチの有無（"yes" / "no"），ある場合はその計測値
+#刀の場合はハバキの大きさ
+machi = "no"
+ML = 0
+MW = 0
+#持ち手と刃の結合位置は次から選択： "top" / "center"
+align_mode = "top" 
+#鍔（つば）の有無（"yes" / "no"），ある場合はその計測値
+tsuba = "no"
+TD = 0
+#柄の計測値
+HL = 125
+HW = 25
+HT = 15
+#刃と峰の形状は次から選択： "line" / "curve" / "line-curve" / "curve-line"
+connections_mine = "line-curve" 
+connections_ha = "curve"
+
+###計測値入力部分 ここまで####################################
+
+###以下モデリング部分###
+###点設定
+Mn0a = FreeCAD.Vector(0, BYa0, BT/2)
+Mn0b = FreeCAD.Vector(0, BYa0, -BT/2)
+Mn0 = FreeCAD.Vector(0, BYa0, 0)
+Mn1 = FreeCAD.Vector(BXa1, BYa1, 0)
+Mn2 = FreeCAD.Vector(BXa2, BYa2, 0)
+Mn3 = FreeCAD.Vector(BXa3, BYa3, 0)
+Ha0 = FreeCAD.Vector(0, 0, 0)
+Ha1 = FreeCAD.Vector(BXb1, BYb1, 0)
+Ha2 = FreeCAD.Vector(BXb2, BYb2, 0)
+Ha3 = FreeCAD.Vector(BXb3, BYb3, 0)
+Snt = FreeCAD.Vector(BX4, BY4, 0)
+###補助関数
+def create_edge(pattern, points):
+    """ 4つの計測点から刃のエッジを作成 """
+    if pattern == "line":
+        edges = [Part.LineSegment(points[i], points[i+1]).toShape() for i in range(len(points)-1)]
+        return Part.Compound(edges)
+    elif pattern == "curve":
+        curve = Part.BSplineCurve()
+        curve.interpolate(points)
+        return curve.toShape()
+    elif pattern == "line-curve":
+        line = Part.LineSegment(points[0], points[1]).toShape()
+        curve = Part.BSplineCurve()
+        curve.interpolate(points[1:])  # 2〜5点目（4点）で補間
+        curve_shape = curve.toShape()
+        return Part.Compound([line, curve_shape])
+    elif pattern == "curve-line":
+        curve = Part.BSplineCurve()
+        curve.interpolate(points[0:4])  # 1〜4点目（4点）で補間
+        curve_shape = curve.toShape()
+        line = Part.LineSegment(points[3], points[4]).toShape()
+        return Part.Compound([curve_shape, line])
+    else:
+        raise ValueError(f"Invalid connections pattern: '{pattern}'. Expected 'line', 'curve', 'line-curve', or 'curve-line'.")
+#
+def extract_edges(shape):
+    """ Compound のエッジを展開，すでにエッジならリスト化して返す """
+    if isinstance(shape, Part.Compound):
+        return shape.SubShapes
+    return [shape]
+#
+def rotate_shape_symmetrically(shape, center, target_point, thickness):
+    import math
+    """ xy平面で作成した峰の辺をz方向に回転させ厚みを出す """
+    v = target_point.sub(center)
+    length = v.Length
+    z_target = thickness / 2
+    theta_rad = math.asin(z_target / length)
+    theta_deg = math.degrees(theta_rad)
+    axis = FreeCAD.Vector(0, 1, 0)
+    def make_rotated_shape(shape, angle_deg):
+        T1 = FreeCAD.Placement(-center, FreeCAD.Rotation())  # center を原点に移動
+        R = FreeCAD.Placement(FreeCAD.Vector(0, 0, 0), FreeCAD.Rotation(axis, angle_deg))  # 原点で回転
+        T2 = FreeCAD.Placement(center, FreeCAD.Rotation())  # 元の位置に戻す
+        placement = T2.multiply(R.multiply(T1))
+        rotated = shape.copy()
+        rotated.Placement = placement
+        return rotated
+    rotated_plus = make_rotated_shape(shape, theta_deg)
+    rotated_minus = make_rotated_shape(shape, -theta_deg)
+    return rotated_plus, rotated_minus
+#
+def sample_edge(edge, num_samples):
+    """ エッジ上に等間隔の点をサンプリング """
+    samples = []
+    if isinstance(edge, list):  # Compound のすべてのエッジを処理
+        for sub_edge in edge:
+            t0, t1 = sub_edge.ParameterRange
+            for i in range(num_samples // len(edge)):  # 各エッジで均等にサンプリング
+                t = t0 + (t1 - t0) * i / ((num_samples // len(edge)) - 1)
+                samples.append(sub_edge.valueAt(t))
+    else:  # 単独のエッジの場合
+        t0, t1 = edge.ParameterRange
+        for i in range(num_samples):
+            t = t0 + (t1 - t0) * i / (num_samples - 1)
+            samples.append(edge.valueAt(t))
+    return samples
+#
+def create_face_from_edges(edge1, edge2, num_samples=36):# サンプリング点数は2,3の公倍数にすること(36,72等)
+    """ 2つのエッジのサンプリング点を使って四角形または三角形のメッシュを作成 """
+    samples1 = sample_edge(edge1, num_samples)
+    samples2 = sample_edge(edge2, num_samples)
+    faces = []
+    for i in range(len(samples1) - 1):
+        try:
+            pt1 = samples1[i]      
+            pt2 = samples1[i+1]    
+            pt3 = samples2[i+1]    
+            pt4 = samples2[i]      
+            if pt1 == pt2 and pt3 == pt4:
+                continue
+            if pt1 != pt2 and pt3 != pt4:
+                wire1 = Part.makePolygon([pt1, pt2])
+                wire2 = Part.makePolygon([pt3, pt4])
+                face = Part.makeRuledSurface(wire1, wire2)
+            elif pt1 == pt2:
+                wire = Part.makePolygon([pt1, pt3, pt4, pt1])  
+                face = Part.makeFilledFace(wire)
+            elif pt3 == pt4:
+                wire = Part.makePolygon([pt1, pt2, pt3, pt1])  
+                face = Part.makeFilledFace(wire)
+            else:
+                continue
+            faces.append(face)
+        except Exception:
+            pass
+    if len(faces) == 0:
+        return None
+    elif len(faces) == 1:
+        return faces[0]
+    else:
+        return Part.makeCompound(faces)
+#
+def fuse_handle_and_blade(blade, handle, machi, tsuba):
+    """刃, マチ, 鍔, 柄の合成"""
+    parts = [blade]
+    offset_x = 0  # X方向の押し出しオフセット（柄の位置決め）   
+    if machi == "yes":# マチを作成
+        machi_shape = Part.makeBox(ML, MW, BT)
+        machi_shape.translate(FreeCAD.Vector(-ML, BYa0-MW, -BT /2))
+        parts.append(machi_shape)
+        offset_x += ML
+    if tsuba == "yes":# 鍔を作成（厚み5mm）
+        tsuba_raw = Part.makeCylinder(TD/2, 5)
+        rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), 90)
+        tsuba_shape = tsuba_raw.copy()
+        tsuba_shape.Placement = FreeCAD.Placement(FreeCAD.Vector(), rotation)
+        tsuba_shape.translate(FreeCAD.Vector(-(offset_x+5), BYa0-MW/2, -BT /2))
+        parts.append(tsuba_shape)
+        offset_x += 5  
+    if align_mode == "top":
+        handle.translate(FreeCAD.Vector(-(HL+offset_x), BYa0-HW, -HT/2))
+    elif align_mode == "center":
+        if machi == "yes":
+            handle.translate(FreeCAD.Vector(-(HL+offset_x), BYa0-(MW+HW)/2, -HT/2))
+        else:
+            handle.translate(FreeCAD.Vector(-(HL+offset_x), (BYa0-HW)/2, -HT/2))
+    else:
+        raise ValueError("Invalid align_mode internally resolved.")
+    parts.append(handle)
+    fused_total = Part.makeCompound(parts)
+    return fused_total
+#
+###刃を作成
+#刃のエッジ作成
+ha_points = ([Ha0, Ha1, Ha2, Ha3, Snt])
+ha = create_edge(connections_ha, ha_points)
+mine0_points = ([Mn0, Mn1, Mn2, Mn3, Snt])
+mine0 = create_edge(connections_mine, mine0_points)
+mine1, mine2 = rotate_shape_symmetrically(mine0, Snt, Mn0, BT)
+nemoto1 = Part.LineSegment(Mn0a,Ha0).toShape()
+nemoto2r = Part.LineSegment(Ha0,Mn0b).toShape()
+nemoto3 = Part.LineSegment(Mn0b,Mn0a).toShape()
+#刃の面作成
+edges1a =  extract_edges(mine1)
+edges1b =  extract_edges(mine2)
+edges2 =  extract_edges(ha)
+face1 = create_face_from_edges(edges1a, edges2)
+face2 = create_face_from_edges(edges1b, edges2)
+minemen = create_face_from_edges(edges1a, edges1b)
+nemotomen = Part.Face(Part.Wire([nemoto1, nemoto3, nemoto2r]))
+bladeComp = Part.makeCompound([face1, face2, minemen, nemotomen])
+###柄を作成
+box = Part.makeBox(HL, HW, HT)
+edges_to_fillet = []
+for edge in box.Edges:
+    v1, v2 = edge.Vertexes
+    if abs(v1.Point.x - v2.Point.x) > 0:  # X方向に伸びたエッジ
+        edges_to_fillet.append(edge)
+fillet_radius = min(HW,HT)/3  # 丸める半径
+handle = box.makeFillet(fillet_radius, edges_to_fillet)
+###刃，マチ，柄の結合
+hocho = fuse_handle_and_blade(bladeComp, handle, machi, tsuba)
+###出力
+
+hochoOBJ = doc.addObject("Part::Feature","hocho")
+hochoOBJ.Shape = hocho
+doc.recompute()
+Gui.ActiveDocument.ActiveView.fitAll()
