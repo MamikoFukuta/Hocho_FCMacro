@@ -1,2 +1,3 @@
 # Hocho_FCMacro
-The Python script for FreeCAD that generates a 3D model of a kitchen knife based on real-world measurements.
+Hocho.FCMacroはFreeCADで実行する包丁を計測値に基づいて3次元モデル化するPythonスクリプトです。包丁モデルと被害者のCT再構成像を組み合わせることにより，刺創等の
+成傷機転について理解を深めることを想定している。各種和包丁および日本刀のモデリングに対応している。
